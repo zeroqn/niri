@@ -778,9 +778,7 @@ impl State {
         }
 
         if matches!(&self.backend, Backend::Winit(_)) {
-            warn!(
-                "config requests virtual outputs, but the Winit backend does not support them"
-            );
+            warn!("config requests virtual outputs, but the Winit backend does not support them");
             return;
         }
 
@@ -789,11 +787,7 @@ impl State {
             //
             // We check both the compositor output list (connected outputs) and the IPC output
             // state, because virtual outputs can exist while being currently disconnected (`off`).
-            let exists = self
-                .niri
-                .global_space
-                .outputs()
-                .any(|o| o.name() == name)
+            let exists = self.niri.global_space.outputs().any(|o| o.name() == name)
                 || self
                     .backend
                     .ipc_outputs()
@@ -3719,6 +3713,7 @@ impl Niri {
         let map_to_output = config.input.touch.map_to_output.as_ref();
         map_to_output
             .and_then(|name| self.output_by_name_match(name))
+            .or_else(|| self.layout.active_output())
             .or_else(|| self.global_space.outputs().next())
     }
 
