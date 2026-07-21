@@ -483,7 +483,8 @@ impl Headless {
                 true
             }
             Err(err) => {
-                debug!("error importing dmabuf: {err:?}");
+                //debug!("error importing dmabuf: {err:?}");
+                debug!(?dmabuf, ?err, "error importing dmabuf");
                 false
             }
         }
