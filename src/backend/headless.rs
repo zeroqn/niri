@@ -2,8 +2,6 @@
 
 use std::collections::HashMap;
 use std::mem;
-use std::os::fd::{FromRawFd, OwnedFd};
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -19,14 +17,15 @@ use smithay::backend::drm::DrmDeviceFd;
 use smithay::backend::drm::DrmNode;
 use smithay::backend::egl::native::EGLSurfacelessDisplay;
 use smithay::backend::egl::{EGLContext, EGLDevice, EGLDisplay};
-use smithay::backend::libinput::LibinputInputBackend;
+use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
 use smithay::backend::renderer::element::RenderElementStates;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::{ImportDma, ImportEgl};
+use smithay::backend::session::libseat::LibSeatSession;
+use smithay::backend::session::{Event as SessionEvent, Session};
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::calloop::LoopHandle;
-use smithay::reexports::input;
 use smithay::reexports::input::Libinput;
 use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
 #[cfg(feature = "xdp-gnome-screencast")]
@@ -53,11 +52,11 @@ pub struct Headless {
     /// This is required for PipeWire/portal screencasting (e.g. Discord/OBS PipeWire sources).
     #[cfg(feature = "xdp-gnome-screencast")]
     gbm: Option<GbmDevice<DrmDeviceFd>>,
+    _session: Option<LibSeatSession>,
+    libinput: Option<Libinput>,
     ipc_outputs: Arc<Mutex<IpcOutputMap>>,
-    /// Seat name used for both libinput udev enumeration (`udev_assign_seat`) and the compositor
+    /// Seat name returned by libseat and used for libinput udev enumeration and the compositor
     /// `wl_seat` name.
-    ///
-    /// This defaults to `seat0` and can be overridden with `XDG_SEAT`.
     udev_seat: String,
     /// Counter for auto-naming headless outputs (HEADLESS-1, HEADLESS-2, etc.)
     output_counter: u32,
@@ -66,20 +65,67 @@ pub struct Headless {
 }
 
 impl Headless {
-    pub fn new(event_loop: LoopHandle<'static, State>) -> Self {
-        let udev_seat = std::env::var("XDG_SEAT").unwrap_or_else(|_| "seat0".to_owned());
-        init_headless_libinput(event_loop, &udev_seat);
+    pub fn new(event_loop: LoopHandle<'static, State>) -> anyhow::Result<Self> {
+        let (session, notifier) =
+            LibSeatSession::new().context("error creating a session for the headless backend")?;
+        let udev_seat = session.seat();
 
-        Self {
+        let mut libinput = Libinput::new_with_udev(LibinputSessionInterface::from(session.clone()));
+        unsafe { super::libinput_plugins::init_libinput_plugin_system(&libinput) };
+        libinput
+            .udev_assign_seat(&udev_seat)
+            .map_err(|()| anyhow::anyhow!("error assigning the seat to headless libinput"))?;
+
+        if !session.is_active() {
+            debug!("headless session is not active, starting libinput in paused state");
+            libinput.suspend();
+        }
+
+        let input_backend = LibinputInputBackend::new(libinput.clone());
+        event_loop
+            .insert_source(input_backend, |mut event, _, state| {
+                state.process_libinput_event(&mut event);
+                state.process_input_event(event);
+            })
+            .unwrap();
+
+        event_loop
+            .insert_source(notifier, |event, _, state| {
+                state.backend.headless().on_session_event(event);
+            })
+            .unwrap();
+
+        Ok(Self {
             renderer: None,
             dmabuf_global: None,
             render_node: None,
             #[cfg(feature = "xdp-gnome-screencast")]
             gbm: None,
+            _session: Some(session),
+            libinput: Some(libinput),
             ipc_outputs: Default::default(),
             udev_seat,
             output_counter: 0,
             outputs: HashMap::new(),
+        })
+    }
+
+    fn on_session_event(&mut self, event: SessionEvent) {
+        let Some(libinput) = self.libinput.as_mut() else {
+            return;
+        };
+
+        match event {
+            SessionEvent::PauseSession => {
+                debug!("pausing headless session");
+                libinput.suspend();
+            }
+            SessionEvent::ActivateSession => {
+                debug!("resuming headless session");
+                if libinput.resume().is_err() {
+                    warn!("error resuming headless libinput");
+                }
+            }
         }
     }
 
@@ -515,6 +561,8 @@ impl Default for Headless {
             render_node: None,
             #[cfg(feature = "xdp-gnome-screencast")]
             gbm: None,
+            _session: None,
+            libinput: None,
             ipc_outputs: Default::default(),
             udev_seat: "seat0".to_string(),
             output_counter: 0,
@@ -544,58 +592,4 @@ fn try_init_headless_gbm_device(render_node: DrmNode) -> anyhow::Result<GbmDevic
     let device_fd = DrmDeviceFd::new(DeviceFd::from(owned_fd));
     let gbm = GbmDevice::new(device_fd).context("error creating GBM device")?;
     Ok(gbm)
-}
-
-#[derive(Clone)]
-struct HeadlessLibinputInterface;
-
-impl input::LibinputInterface for HeadlessLibinputInterface {
-    fn open_restricted(&mut self, path: &Path, flags: i32) -> Result<OwnedFd, i32> {
-        use std::ffi::CString;
-        use std::os::unix::ffi::OsStrExt;
-
-        let c_path = CString::new(path.as_os_str().as_bytes()).map_err(|_| libc::EINVAL)?;
-        // Keep libinput's requested access mode (read-only vs read-write), but add a few
-        // safety/behavior flags (mirrors libseat's noop backend).
-        let flags = flags | libc::O_CLOEXEC | libc::O_NOCTTY | libc::O_NOFOLLOW | libc::O_NONBLOCK;
-        let fd = unsafe { libc::open(c_path.as_ptr(), flags) };
-        if fd < 0 {
-            let errno = unsafe { *libc::__errno_location() };
-
-            if errno == libc::ENOENT || errno == libc::ENODEV {
-                trace!("headless: libinput open_restricted failed for {path:?}: errno={errno}");
-            } else {
-                debug!("headless: libinput open_restricted failed for {path:?}: errno={errno}");
-            }
-            return Err(errno);
-        }
-
-        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
-    }
-
-    fn close_restricted(&mut self, fd: OwnedFd) {
-        drop(fd);
-    }
-}
-
-fn init_headless_libinput(event_loop: LoopHandle<'static, State>, seat: &str) {
-    let mut libinput = Libinput::new_with_udev(HeadlessLibinputInterface);
-
-    unsafe { super::libinput_plugins::init_libinput_plugin_system(&libinput) };
-
-    if libinput.udev_assign_seat(seat).is_err() {
-        debug!("headless: failed to assign libinput seat {seat:?}; input will be unavailable");
-        return;
-    }
-
-    let input_backend = LibinputInputBackend::new(libinput);
-    if event_loop
-        .insert_source(input_backend, |mut event, _, state| {
-            state.process_libinput_event(&mut event);
-            state.process_input_event(event);
-        })
-        .is_err()
-    {
-        debug!("headless: failed to insert libinput backend; input will be unavailable");
-    }
 }
